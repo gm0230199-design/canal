@@ -1,0 +1,16 @@
+{
+  "name": "canal",
+  "version": "0.1.0",
+  "description": "Zero-dependency GitHub Issue communication client for agent coordination",
+  "type": "module",
+  "bin": {
+    "canal": "./src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
