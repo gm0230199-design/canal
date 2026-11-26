@@ -893,14 +893,7 @@ async function fetchSortedComments({ repo, issue, token, fetchImpl, apiBase }) {
   });
 }
 
-export async function statusIssue({
-  repo,
-  issue,
-  role,
-  fetchImpl = globalThis.fetch,
-  env = process.env,
-  apiBase = DEFAULT_API_BASE
-}) {
+async function analyzeThread({ repo, issue, role, fetchImpl, env, apiBase }) {
   const { repo: normalizedRepo } = validateRepo(repo);
   const issueNum = validateIssue(issue);
   if (role !== undefined && role !== null && String(role).trim() !== '') {
@@ -925,14 +918,22 @@ export async function statusIssue({
 
   const byRole = { AGENTE: 0, EJECUTOR: 0, sin_prefijo: 0 };
   const lastByRole = { AGENTE: null, EJECUTOR: null };
+  const ultimoPorRol = { AGENTE: null, EJECUTOR: null };
 
   for (const { comment, meta } of annotated) {
     if (meta.role === 'AGENTE' || meta.role === 'EJECUTOR') {
       byRole[meta.role] += 1;
+      const bodyStr = String(comment.body ?? '');
       lastByRole[meta.role] = {
         id: comment.id,
         created_at: comment.created_at,
-        body: String(comment.body ?? '').slice(0, 120)
+        body: bodyStr.slice(0, 120)
+      };
+      const firstLine = bodyStr.replace(/\r\n/g, '\n').split('\n', 1)[0];
+      ultimoPorRol[meta.role] = {
+        id: comment.id,
+        created_at: comment.created_at,
+        primera_linea: firstLine
       };
     } else {
       byRole.sin_prefijo += 1;
@@ -977,26 +978,174 @@ export async function statusIssue({
 
   const tasksMap = deriveTasksFromComments(sorted);
 
+  const unanswered = role
+    ? computeUnansweredFor(role)
+    : {
+        AGENTE: computeUnansweredFor('AGENTE'),
+        EJECUTOR: computeUnansweredFor('EJECUTOR')
+      };
+
+  const pendingEcho = role
+    ? computePendingEchoFor(role)
+    : {
+        AGENTE: computePendingEchoFor('AGENTE'),
+        EJECUTOR: computePendingEchoFor('EJECUTOR')
+      };
+
   return {
-    repo: normalizedRepo,
-    issue: issueNum,
-    ...(role ? { role } : {}),
-    comments_total: annotated.length,
-    by_role: byRole,
-    last_by_role: lastByRole,
-    unanswered: role
-      ? computeUnansweredFor(role)
-      : {
-          AGENTE: computeUnansweredFor('AGENTE'),
-          EJECUTOR: computeUnansweredFor('EJECUTOR')
-        },
-    pending_echo: role
-      ? computePendingEchoFor(role)
-      : {
-          AGENTE: computePendingEchoFor('AGENTE'),
-          EJECUTOR: computePendingEchoFor('EJECUTOR')
-        },
-    tasks: formatTaskBoard(tasksMap, role)
+    normalizedRepo,
+    issueNum,
+    role,
+    commentsTotal: annotated.length,
+    byRole,
+    lastByRole,
+    ultimoPorRol,
+    unanswered,
+    pendingEcho,
+    tasksMap
+  };
+}
+
+export async function statusIssue({
+  repo,
+  issue,
+  role,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const analysis = await analyzeThread({
+    repo,
+    issue,
+    role,
+    fetchImpl,
+    env,
+    apiBase
+  });
+
+  return {
+    repo: analysis.normalizedRepo,
+    issue: analysis.issueNum,
+    ...(analysis.role ? { role: analysis.role } : {}),
+    comments_total: analysis.commentsTotal,
+    by_role: analysis.byRole,
+    last_by_role: analysis.lastByRole,
+    unanswered: analysis.unanswered,
+    pending_echo: analysis.pendingEcho,
+    tasks: formatTaskBoard(analysis.tasksMap, analysis.role)
+  };
+}
+
+function buildSiguientePaso({ tasksMap, role, sinResponder, esperandoAMi }) {
+  const all = [...tasksMap.values()].sort((a, b) => a.id.localeCompare(b.id));
+  const blocked = all.filter((t) => t.estado === 'blocked');
+  const open = all.filter((t) => t.estado === 'open');
+  const inProgressMine = all.filter(
+    (t) => t.estado === 'in_progress' && (!role || t.asignado_a === role)
+  );
+  const claimedMine = all.filter(
+    (t) => t.estado === 'claimed' && (!role || t.asignado_a === role)
+  );
+
+  const parts = [];
+
+  if (blocked.length > 0) {
+    const latestBlocked = [...blocked].sort((a, b) => {
+      const ta = Date.parse(a.bloqueado_en?.created_at || '') || 0;
+      const tb = Date.parse(b.bloqueado_en?.created_at || '') || 0;
+      if (tb !== ta) return tb - ta;
+      const ida = Number(a.bloqueado_en?.id || 0);
+      const idb = Number(b.bloqueado_en?.id || 0);
+      if (idb !== ida) return idb - ida;
+      return b.id.localeCompare(a.id);
+    })[0];
+    const reason = latestBlocked.bloqueado_en?.reason || 'sin motivo especificado';
+    parts.push(`Bloqueado ${latestBlocked.id}: ${reason}.`);
+  }
+
+  if (inProgressMine.length > 0) {
+    const label = role ? ` (${role})` : '';
+    parts.push(`En progreso${label}: ${inProgressMine.map((t) => t.id).join(', ')}.`);
+  }
+
+  if (claimedMine.length > 0) {
+    const label = role ? ` (${role})` : '';
+    parts.push(`Reclamado${label} sin avance: ${claimedMine.map((t) => t.id).join(', ')}.`);
+  }
+
+  if (open.length > 0) {
+    parts.push(
+      `Hay ${open.length} bloque(s) open sin reclamar (${open.map((t) => t.id).join(', ')}).`
+    );
+  }
+
+  if (parts.length === 0) {
+    const sinResponderCount = Array.isArray(sinResponder)
+      ? sinResponder.length
+      : (sinResponder.AGENTE?.length || 0) + (sinResponder.EJECUTOR?.length || 0);
+    const esperandoCount = Array.isArray(esperandoAMi)
+      ? esperandoAMi.length
+      : (esperandoAMi.AGENTE?.length || 0) + (esperandoAMi.EJECUTOR?.length || 0);
+
+    if (sinResponderCount > 0) {
+      parts.push(`Responder ${sinResponderCount} comentario(s) pendiente(s) del otro rol.`);
+    } else if (esperandoCount > 0) {
+      parts.push(`Esperando respuesta del otro rol a ${esperandoCount} comentario(s).`);
+    } else if (all.length === 0) {
+      parts.push('Hilo sin tareas ni mensajes pendientes.');
+    } else {
+      parts.push(`Todos los bloques (${all.length}) están en done y sin mensajes pendientes.`);
+    }
+  }
+
+  return parts.join(' ');
+}
+
+export async function briefIssue({
+  repo,
+  issue,
+  role,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const analysis = await analyzeThread({
+    repo,
+    issue,
+    role,
+    fetchImpl,
+    env,
+    apiBase
+  });
+
+  const tasks = formatTaskBoard(analysis.tasksMap, analysis.role);
+  const enCurso = [...analysis.tasksMap.values()]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .filter((t) => t.estado !== 'done')
+    .map((t) => ({
+      id: t.id,
+      estado: t.estado,
+      asignado_a: t.asignado_a
+    }));
+
+  const siguientePaso = buildSiguientePaso({
+    tasksMap: analysis.tasksMap,
+    role: analysis.role,
+    sinResponder: analysis.unanswered,
+    esperandoAMi: analysis.pendingEcho
+  });
+
+  return {
+    repo: analysis.normalizedRepo,
+    issue: analysis.issueNum,
+    ...(analysis.role ? { role: analysis.role } : {}),
+    ultimo_por_rol: analysis.ultimoPorRol,
+    sin_responder: analysis.unanswered,
+    esperando_a_mi: analysis.pendingEcho,
+    tasks,
+    en_curso: enCurso,
+    siguiente_paso: siguientePaso,
+    generado_en: new Date().toISOString()
   };
 }
 

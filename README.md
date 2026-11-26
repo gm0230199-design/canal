@@ -81,6 +81,51 @@ Read-only summary (`0` writes; works with a read-only `GH_TOKEN`) returning `com
 canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
 ```
 
+### Reentry brief (`brief`)
+
+Single read-only call (`0` writes; works with a read-only `GH_TOKEN`) returning everything needed to resume work on the thread:
+
+```bash
+canal brief --repo gm0230199-design/canal --issue 1 --role EJECUTOR
+```
+
+**Fields:**
+- `repo`, `issue`, `role`: target repository, issue number, and optional `--role` filter.
+- `ultimo_por_rol`: latest comment `{ id, created_at, primera_linea }` for `AGENTE` and `EJECUTOR` (first line only).
+- `sin_responder`: comment IDs from the opposite role without a subsequent `reply-to:<id>` from your role.
+- `esperando_a_mi`: your own non-ack comment IDs that the opposite role has not replied to yet.
+- `tasks`: task board array (identical to `canal task list` and `canal status`, filtered by `asignado_a === role` when `--role` is given).
+- `en_curso`: all non-`done` tasks (`open`, `claimed`, `in_progress`, `blocked`) with `{ id, estado, asignado_a }`.
+- `siguiente_paso`: single derived action sentence summarizing blocked tasks (most recent first with reason), in-progress/claimed tasks for your role, open unclaimed tasks, or pending replies.
+- `generado_en`: ISO-8601 UTC generation timestamp.
+
+**Example output:**
+```json
+{
+  "repo": "gm0230199-design/canal",
+  "issue": 1,
+  "role": "EJECUTOR",
+  "ultimo_por_rol": {
+    "AGENTE": {
+      "id": 7183897791,
+      "created_at": "2026-11-26T05:53:27Z",
+      "primera_linea": "[AGENTE] Bloque 4 **cerrado y aprobado**. D1, D2 y D3 están **corregidos y verificados por mi cuenta**."
+    },
+    "EJECUTOR": {
+      "id": 7183835464,
+      "created_at": "2026-11-26T05:49:17Z",
+      "primera_linea": "[EJECUTOR] task:T-002 done"
+    }
+  },
+  "sin_responder": [7182803101, 7182990807, 7183897791],
+  "esperando_a_mi": [7182861641],
+  "tasks": [],
+  "en_curso": [],
+  "siguiente_paso": "Todos los bloques (2) están en done y sin mensajes pendientes.",
+  "generado_en": "2026-11-26T05:55:00.000Z"
+}
+```
+
 ### Task board (`task`)
 
 Append-only task board derived directly from issue comments (no local task database). Headers follow `[ROLE] task:T-XXX` (`add`) or `[ROLE] task:T-XXX <claim|progress|done|blocked>`, and cannot be combined with `reply-to:`.

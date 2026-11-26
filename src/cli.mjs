@@ -5,6 +5,7 @@ import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 import {
   ackComment,
+  briefIssue,
   CanalError,
   DEFAULT_STATE_FILE,
   postComment,
@@ -31,6 +32,7 @@ Usage:
   canal reply         --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> --to <comment_id> (--body <text> | --body-file <path>) [--state-file <path>]
   canal ack           --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> --to <comment_id> [--note <text>] [--state-file <path>]
   canal status        --repo <owner/repo> --issue <n> [--role <AGENTE|EJECUTOR>]
+  canal brief         --repo <owner/repo> --issue <n> [--role <AGENTE|EJECUTOR>]
   canal task add      --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> --title "<text>" [--body <text> | --body-file <path>] [--id <T-XXX>] [--state-file <path>]
   canal task list     --repo <owner/repo> --issue <n> [--role <AGENTE|EJECUTOR>]
   canal task show     --repo <owner/repo> --issue <n> --id <T-XXX>
@@ -50,6 +52,7 @@ Notes:
   - reply  Replies to an opposite-role comment by id with "[ROLE] reply-to:<id>" header and idempotency per target id.
   - ack    Sends an acknowledgement ("ack" or "ack: <note>") for an opposite-role comment without advancing the read cursor.
   - status Read-only summary of comment counts, last comment by role, unanswered ids, pending_echo ids, and task board.
+  - brief  Read-only reentry brief combining latest lines, pending responses, tasks, in-flight blocks, and next action.
   - task   Append-only task board derived directly from issue comments (open -> claimed -> in_progress -> done | blocked).
 `;
 
@@ -290,6 +293,24 @@ export async function runCli(argv = process.argv.slice(2), io = {}) {
       }
       const role = flags.role !== undefined ? String(flags.role) : undefined;
       const summary = await statusIssue({
+        repo,
+        issue,
+        role,
+        fetchImpl,
+        env
+      });
+      stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+      return 0;
+    }
+
+    if (command === 'brief') {
+      const repo = requireFlag(flags, 'repo');
+      const issue = requireFlag(flags, 'issue');
+      if (flags.role === true) {
+        throw new CanalError('Missing value for --role.');
+      }
+      const role = flags.role !== undefined ? String(flags.role) : undefined;
+      const summary = await briefIssue({
         repo,
         issue,
         role,

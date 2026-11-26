@@ -7,6 +7,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import {
   ackComment,
+  briefIssue,
   CanalError,
   ensureRolePrefix,
   loadState,
@@ -1550,6 +1551,209 @@ test('D3: taskAdd write-ahead reservation prevents duplicate block on socket han
       ['T-001', 'T-009']
     );
   });
+});
+
+test('briefIssue makes 0 POST calls, handles empty thread, and matches key order', async () => {
+  let postCalls = 0;
+  const fetchImpl = async (_url, opts = {}) => {
+    if (opts.method && opts.method.toUpperCase() !== 'GET') {
+      postCalls += 1;
+    }
+    return makeResponse([], { status: 200 });
+  };
+
+  let out = '';
+  let err = '';
+  const code = await runCli(['brief', '--repo', 'o/r', '--issue', '1', '--role', 'EJECUTOR'], {
+    env: { GH_TOKEN: 'read-only-token' },
+    fetchImpl,
+    stdout: { write: (s) => (out += s) },
+    stderr: { write: (s) => (err += s) }
+  });
+
+  assert.equal(code, 0);
+  assert.equal(err, '');
+  assert.equal(postCalls, 0);
+
+  const brief = JSON.parse(out);
+  assert.deepEqual(Object.keys(brief), [
+    'repo',
+    'issue',
+    'role',
+    'ultimo_por_rol',
+    'sin_responder',
+    'esperando_a_mi',
+    'tasks',
+    'en_curso',
+    'siguiente_paso',
+    'generado_en'
+  ]);
+  assert.deepEqual(brief.ultimo_por_rol, { AGENTE: null, EJECUTOR: null });
+  assert.deepEqual(brief.sin_responder, []);
+  assert.deepEqual(brief.esperando_a_mi, []);
+  assert.deepEqual(brief.tasks, []);
+  assert.deepEqual(brief.en_curso, []);
+  assert.match(brief.siguiente_paso, /sin tareas/i);
+  assert.ok(!Number.isNaN(Date.parse(brief.generado_en)));
+});
+
+test('briefIssue matches task list and status.tasks (--role present/absent), tracks esperando_a_mi, en_curso, and latest blocked in siguiente_paso', async () => {
+  let postCalls = 0;
+  const comments = [
+    {
+      id: 1,
+      created_at: '2026-11-26T04:00:00Z',
+      body: '[AGENTE] primera orden\nsegunda linea'
+    },
+    {
+      id: 2,
+      created_at: '2026-11-26T04:01:00Z',
+      body: '[EJECUTOR] reply-to:1\n\nprimera orden hecha'
+    },
+    {
+      id: 3,
+      created_at: '2026-11-26T04:02:00Z',
+      body: 'ruido humano sin prefijo'
+    },
+    {
+      id: 4,
+      created_at: '2026-11-26T04:03:00Z',
+      body: '[EJECUTOR] mensaje propio sin eco'
+    },
+    {
+      id: 5,
+      created_at: '2026-11-26T04:04:00Z',
+      body: '[AGENTE] task:T-001\n\nTitle: Bloque done'
+    },
+    {
+      id: 6,
+      created_at: '2026-11-26T04:05:00Z',
+      body: '[EJECUTOR] task:T-001 claim'
+    },
+    {
+      id: 7,
+      created_at: '2026-11-26T04:06:00Z',
+      body: '[EJECUTOR] task:T-001 done'
+    },
+    {
+      id: 8,
+      created_at: '2026-11-26T04:07:00Z',
+      body: '[AGENTE] task:T-002\n\nTitle: Bloque open'
+    },
+    {
+      id: 9,
+      created_at: '2026-11-26T04:08:00Z',
+      body: '[AGENTE] task:T-003\n\nTitle: Bloque claimed'
+    },
+    {
+      id: 10,
+      created_at: '2026-11-26T04:09:00Z',
+      body: '[EJECUTOR] task:T-003 claim'
+    },
+    {
+      id: 11,
+      created_at: '2026-11-26T04:10:00Z',
+      body: '[AGENTE] task:T-004\n\nTitle: Bloque in_progress'
+    },
+    {
+      id: 12,
+      created_at: '2026-11-26T04:11:00Z',
+      body: '[EJECUTOR] task:T-004 claim'
+    },
+    {
+      id: 13,
+      created_at: '2026-11-26T04:12:00Z',
+      body: '[EJECUTOR] task:T-004 progress\n\nprogreso'
+    },
+    {
+      id: 14,
+      created_at: '2026-11-26T04:13:00Z',
+      body: '[AGENTE] task:T-005\n\nTitle: Bloque blocked viejo'
+    },
+    {
+      id: 15,
+      created_at: '2026-11-26T04:14:00Z',
+      body: '[EJECUTOR] task:T-005 blocked\n\nmotivo antiguo'
+    },
+    {
+      id: 16,
+      created_at: '2026-11-26T04:15:00Z',
+      body: '[AGENTE] task:T-006\n\nTitle: Bloque blocked reciente'
+    },
+    {
+      id: 17,
+      created_at: '2026-11-26T04:16:00Z',
+      body: '[EJECUTOR] task:T-006 blocked\n\nfalta credencial SSH'
+    }
+  ];
+
+  const fetchImpl = async (_url, opts = {}) => {
+    if (opts.method && opts.method.toUpperCase() !== 'GET') {
+      postCalls += 1;
+    }
+    return makeResponse(comments, { status: 200 });
+  };
+
+  const env = { GH_TOKEN: 'read-only-token' };
+
+  const briefEjecutor = await briefIssue({
+    repo: 'o/r',
+    issue: 1,
+    role: 'EJECUTOR',
+    fetchImpl,
+    env
+  });
+  const listEjecutor = await taskList({
+    repo: 'o/r',
+    issue: 1,
+    role: 'EJECUTOR',
+    fetchImpl,
+    env
+  });
+  const statusEjecutor = await statusIssue({
+    repo: 'o/r',
+    issue: 1,
+    role: 'EJECUTOR',
+    fetchImpl,
+    env
+  });
+
+  assert.equal(postCalls, 0);
+  assert.deepEqual(briefEjecutor.tasks, listEjecutor);
+  assert.deepEqual(briefEjecutor.tasks, statusEjecutor.tasks);
+  assert.equal(briefEjecutor.ultimo_por_rol.AGENTE.primera_linea, '[AGENTE] task:T-006');
+  assert.equal(
+    briefEjecutor.ultimo_por_rol.EJECUTOR.primera_linea,
+    '[EJECUTOR] task:T-006 blocked'
+  );
+  assert.ok(briefEjecutor.esperando_a_mi.includes(2));
+  assert.ok(briefEjecutor.esperando_a_mi.includes(4));
+  assert.ok(!briefEjecutor.esperando_a_mi.includes(3));
+  assert.ok(!briefEjecutor.esperando_a_mi.includes(1));
+
+  // en_curso excludes done (T-001) and includes open (T-002), claimed (T-003), in_progress (T-004), blocked (T-005, T-006)
+  assert.deepEqual(
+    briefEjecutor.en_curso.map((t) => [t.id, t.estado]),
+    [
+      ['T-002', 'open'],
+      ['T-003', 'claimed'],
+      ['T-004', 'in_progress'],
+      ['T-005', 'blocked'],
+      ['T-006', 'blocked']
+    ]
+  );
+
+  // siguiente_paso mentions the MOST RECENT blocked block (T-006) and its reason
+  assert.match(briefEjecutor.siguiente_paso, /T-006/);
+  assert.match(briefEjecutor.siguiente_paso, /falta credencial SSH/);
+
+  // Parity when --role is omitted
+  const briefAll = await briefIssue({ repo: 'o/r', issue: 1, fetchImpl, env });
+  const listAll = await taskList({ repo: 'o/r', issue: 1, fetchImpl, env });
+  const statusAll = await statusIssue({ repo: 'o/r', issue: 1, fetchImpl, env });
+  assert.deepEqual(briefAll.tasks, listAll);
+  assert.deepEqual(briefAll.tasks, statusAll.tasks);
+  assert.equal(briefAll.tasks.length, 6);
 });
 
 test(
