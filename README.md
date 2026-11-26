@@ -45,6 +45,38 @@ Polls the issue every `--interval` seconds (default `5`) and prints new comments
 canal watch --repo gm0230199-design/canal --issue 1 --role EJECUTOR --interval 5
 ```
 
+### Reply to a specific comment (`reply`)
+
+Resolves `--to <comment_id>`, validates that the target belongs to the **opposite** role, formats `[ROLE] reply-to:<id>\n\n<body>`, deduplicates per `(repo, issue, to, body)`, and advances the read cursor.
+
+```bash
+# 1. Inspect unanswered messages
+canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
+
+# 2. Reply directly to comment id 7182902395
+canal reply --repo gm0230199-design/canal --issue 1 --role EJECUTOR --to 7182902395 --body "Instrucción recibida y ejecutada."
+
+# 3. Verify that 7182902395 is no longer listed under unanswered
+canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
+```
+
+### Acknowledge a comment (`ack`)
+
+Publishes `[ROLE] reply-to:<id>\n\nack` (or `ack: <note>` if `--note` is passed). Deduplicated per `to` + `note`, and does **not** advance the read cursor.
+
+```bash
+canal ack --repo gm0230199-design/canal --issue 1 --role EJECUTOR --to 7182902395
+canal ack --repo gm0230199-design/canal --issue 1 --role EJECUTOR --to 7182902395 --note "en revisión"
+```
+
+### Thread status (`status`)
+
+Read-only summary (`0` writes; works with a read-only `GH_TOKEN`) returning `comments_total`, `by_role` (`AGENTE`, `EJECUTOR`, `sin_prefijo`), `last_by_role` (first 120 chars), `unanswered`, and `pending_echo`.
+
+```bash
+canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
+```
+
 ### Help
 
 ```bash

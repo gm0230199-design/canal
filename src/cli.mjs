@@ -4,29 +4,38 @@ import fs from 'node:fs/promises';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 import {
+  ackComment,
   CanalError,
   DEFAULT_STATE_FILE,
   postComment,
   readComments,
+  replyComment,
   sanitizeSecrets,
+  statusIssue,
   watchComments
 } from './canal.mjs';
 
 export const HELP_TEXT = `canal — GitHub Issue communication CLI for agents
 
 Usage:
-  canal read  --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> [--since-id <id>] [--state-file <path>]
-  canal post  --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> (--body <text> | --body-file <path>) [--state-file <path>]
-  canal watch --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> [--interval <sec>] [--since-id <id>] [--state-file <path>] [--once]
+  canal read   --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> [--since-id <id>] [--state-file <path>]
+  canal post   --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> (--body <text> | --body-file <path>) [--state-file <path>]
+  canal watch  --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> [--interval <sec>] [--since-id <id>] [--state-file <path>] [--once]
+  canal reply  --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> --to <comment_id> (--body <text> | --body-file <path>) [--state-file <path>]
+  canal ack    --repo <owner/repo> --issue <n> --role <AGENTE|EJECUTOR> --to <comment_id> [--note <text>] [--state-file <path>]
+  canal status --repo <owner/repo> --issue <n> [--role <AGENTE|EJECUTOR>]
   canal --help
 
 Environment:
   GH_TOKEN or GITHUB_TOKEN   Required GitHub personal/app access token (never stored in files)
 
 Notes:
-  - read  Prints JSON array of comments from the opposite role in ascending chronological order.
-  - post  Enforces [AGENTE] or [EJECUTOR] on the first line and deduplicates via SHA-256 hash in .canal-state.json.
-  - watch Polls every --interval seconds (default: 5) and emits new comments from the opposite role as JSON.
+  - read   Prints JSON array of comments from the opposite role in ascending chronological order.
+  - post   Enforces [AGENTE] or [EJECUTOR] on the first line and deduplicates via SHA-256 hash in .canal-state.json.
+  - watch  Polls every --interval seconds (default: 5) and emits new comments from the opposite role as JSON.
+  - reply  Replies to an opposite-role comment by id with "[ROLE] reply-to:<id>" header and idempotency per target id.
+  - ack    Sends an acknowledgement ("ack" or "ack: <note>") for an opposite-role comment without advancing the read cursor.
+  - status Read-only summary of comment counts, last comment by role, unanswered ids, and pending_echo ids.
 `;
 
 export function parseArgs(argv) {
@@ -183,6 +192,85 @@ export async function runCli(argv = process.argv.slice(2), io = {}) {
           process.removeListener('SIGTERM', onSignal);
         }
       }
+      return 0;
+    }
+
+    if (command === 'reply') {
+      const repo = requireFlag(flags, 'repo');
+      const issue = requireFlag(flags, 'issue');
+      const role = requireFlag(flags, 'role');
+      const to = requireFlag(flags, 'to');
+      const hasBody = flags.body !== undefined;
+      const hasBodyFile = flags['body-file'] !== undefined;
+
+      if (hasBody === hasBodyFile) {
+        throw new CanalError('Specify exactly one of --body or --body-file.');
+      }
+
+      let body;
+      if (hasBodyFile) {
+        const filePath = requireFlag(flags, 'body-file');
+        try {
+          body = await fs.readFile(filePath, 'utf8');
+        } catch (err) {
+          throw new CanalError(`Failed to read --body-file "${filePath}": ${err.message}`);
+        }
+      } else {
+        body = requireFlag(flags, 'body');
+      }
+
+      const result = await replyComment({
+        repo,
+        issue,
+        role,
+        to,
+        body,
+        stateFile,
+        fetchImpl,
+        env
+      });
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return 0;
+    }
+
+    if (command === 'ack') {
+      const repo = requireFlag(flags, 'repo');
+      const issue = requireFlag(flags, 'issue');
+      const role = requireFlag(flags, 'role');
+      const to = requireFlag(flags, 'to');
+      if (flags.note === true) {
+        throw new CanalError('Missing value for --note.');
+      }
+      const note = flags.note !== undefined ? String(flags.note) : undefined;
+      const result = await ackComment({
+        repo,
+        issue,
+        role,
+        to,
+        note,
+        stateFile,
+        fetchImpl,
+        env
+      });
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return 0;
+    }
+
+    if (command === 'status') {
+      const repo = requireFlag(flags, 'repo');
+      const issue = requireFlag(flags, 'issue');
+      if (flags.role === true) {
+        throw new CanalError('Missing value for --role.');
+      }
+      const role = flags.role !== undefined ? String(flags.role) : undefined;
+      const summary = await statusIssue({
+        repo,
+        issue,
+        role,
+        fetchImpl,
+        env
+      });
+      stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
       return 0;
     }
 

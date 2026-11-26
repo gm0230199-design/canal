@@ -78,11 +78,36 @@ export function validateIssue(issue) {
   return num;
 }
 
+export function validateCommentId(commentId) {
+  const num =
+    typeof commentId === 'number' ? commentId : Number(String(commentId ?? '').trim());
+  if (!Number.isInteger(num) || num <= 0) {
+    throw new CanalError(`Invalid --to "${commentId}". Expected a positive integer comment id.`);
+  }
+  return num;
+}
+
+export function parseCommentMeta(body) {
+  if (typeof body !== 'string') {
+    return { role: null, replyTo: null, isAck: false };
+  }
+  const normalized = body.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const firstLine = lines[0].trimStart();
+  const roleMatch = firstLine.match(/^\[(AGENTE|EJECUTOR)\](?:$|\s)/);
+  const role = roleMatch ? roleMatch[1] : null;
+  const replyMatch = firstLine.trim().match(/^\[(?:AGENTE|EJECUTOR)\]\s+reply-to:(\d+)$/);
+  const replyTo = replyMatch ? Number(replyMatch[1]) : null;
+  let isAck = false;
+  if (replyTo !== null) {
+    const rest = lines.slice(1).join('\n').trim();
+    isAck = /^ack(?::\s*.*)?$/i.test(rest);
+  }
+  return { role, replyTo, isAck };
+}
+
 export function detectCommentRole(body) {
-  if (typeof body !== 'string') return null;
-  const firstLine = body.replace(/\r\n/g, '\n').split('\n', 1)[0].trimStart();
-  const match = firstLine.match(/^\[(AGENTE|EJECUTOR)\](?:$|\s)/);
-  return match ? match[1] : null;
+  return parseCommentMeta(body).role;
 }
 
 export function ensureRolePrefix(body, role) {
@@ -104,6 +129,28 @@ export function ensureRolePrefix(body, role) {
   return `[${role}] ${trimmedStart}`;
 }
 
+export function stripRolePrefixForReply(body, role) {
+  validateRole(role);
+  if (typeof body !== 'string' || body.trim().length === 0) {
+    throw new CanalError('Comment body cannot be empty.');
+  }
+  const normalized = body.replace(/\r\n/g, '\n').replace(/^\s+/, '');
+  const detected = detectCommentRole(normalized);
+  if (detected && detected !== role) {
+    throw new CanalError(
+      `Body starts with [${detected}], which does not match --role ${role}.`
+    );
+  }
+  let clean = normalized;
+  if (detected === role) {
+    clean = normalized.slice(`[${role}]`.length).replace(/^[ \t]*\n?/, '').trimStart();
+  }
+  if (clean.trim().length === 0) {
+    throw new CanalError('Comment body cannot be empty.');
+  }
+  return clean;
+}
+
 export function parseNextLink(linkHeader) {
   if (!linkHeader || typeof linkHeader !== 'string') return null;
   const parts = linkHeader.split(',');
@@ -123,23 +170,31 @@ export function computeBodyHash({ repo, issue, body }) {
   return createHash('sha256').update(`${repo}#${issue}\n${body}`, 'utf8').digest('hex');
 }
 
+function emptyState() {
+  return {
+    postedHashes: {},
+    cursors: {},
+    repliesTo: {},
+    acks: {},
+    answered: {}
+  };
+}
+
 export async function loadState(stateFile = DEFAULT_STATE_FILE) {
   try {
     const raw = await fs.readFile(stateFile, 'utf8');
     const parsed = JSON.parse(raw);
-    return {
-      postedHashes:
-        parsed && typeof parsed.postedHashes === 'object' && parsed.postedHashes
-          ? parsed.postedHashes
-          : {},
-      cursors:
-        parsed && typeof parsed.cursors === 'object' && parsed.cursors
-          ? parsed.cursors
-          : {}
-    };
+    const base = emptyState();
+    if (!parsed || typeof parsed !== 'object') return base;
+    for (const key of Object.keys(base)) {
+      if (parsed[key] && typeof parsed[key] === 'object') {
+        base[key] = parsed[key];
+      }
+    }
+    return base;
   } catch (err) {
     if (err && err.code === 'ENOENT') {
-      return { postedHashes: {}, cursors: {} };
+      return emptyState();
     }
     throw new CanalError(`Failed to read state file "${stateFile}": ${err.message}`);
   }
@@ -343,6 +398,10 @@ export async function postComment({
   role,
   body,
   stateFile = DEFAULT_STATE_FILE,
+  stateSection = 'postedHashes',
+  idempotencyKey,
+  extraState,
+  advanceCursorTo,
   fetchImpl = globalThis.fetch,
   env = process.env,
   apiBase = DEFAULT_API_BASE
@@ -352,14 +411,18 @@ export async function postComment({
   validateRole(role);
   const token = getToken(env);
   const prefixedBody = ensureRolePrefix(body, role);
-  const hash = computeBodyHash({
-    repo: normalizedRepo,
-    issue: issueNum,
-    body: prefixedBody
-  });
+  const keyMaterial =
+    idempotencyKey !== undefined
+      ? String(idempotencyKey)
+      : `${normalizedRepo}#${issueNum}\n${prefixedBody}`;
+  const hash = createHash('sha256').update(keyMaterial, 'utf8').digest('hex');
 
-  const state = stateFile ? await loadState(stateFile) : { postedHashes: {}, cursors: {} };
-  const existing = state.postedHashes[hash];
+  const state = stateFile ? await loadState(stateFile) : emptyState();
+  const sectionMap =
+    state[stateSection] && typeof state[stateSection] === 'object'
+      ? state[stateSection]
+      : (state[stateSection] = {});
+  const existing = sectionMap[hash];
   if (existing) {
     return {
       id: existing.commentId ?? null,
@@ -415,12 +478,31 @@ export async function postComment({
 
   const created = await res.json();
   if (stateFile) {
-    state.postedHashes[hash] = {
+    sectionMap[hash] = {
       repo: normalizedRepo,
       issue: issueNum,
       commentId: created.id,
-      created_at: created.created_at
+      created_at: created.created_at,
+      ...(extraState || {})
     };
+    if (extraState && extraState.to !== undefined) {
+      const answeredKey = `${normalizedRepo}#${issueNum}:${role}`;
+      if (!state.answered[answeredKey] || typeof state.answered[answeredKey] !== 'object') {
+        state.answered[answeredKey] = {};
+      }
+      state.answered[answeredKey][String(extraState.to)] = {
+        commentId: created.id,
+        type: stateSection === 'acks' ? 'ack' : 'reply',
+        created_at: created.created_at
+      };
+    }
+    if (advanceCursorTo !== undefined && advanceCursorTo !== null) {
+      const cursorKey = `${normalizedRepo}#${issueNum}:${role}`;
+      const prev = Number(state.cursors[cursorKey] || 0);
+      if (Number(advanceCursorTo) > prev) {
+        state.cursors[cursorKey] = Number(advanceCursorTo);
+      }
+    }
     await saveState(stateFile, state);
   }
 
@@ -431,6 +513,283 @@ export async function postComment({
     skipped: false,
     duplicate: false,
     hash
+  };
+}
+
+export async function resolveTargetComment({
+  repo,
+  issue,
+  to,
+  role,
+  token,
+  fetchImpl = globalThis.fetch,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const { repo: normalizedRepo, owner, name } = validateRepo(repo);
+  const issueNum = validateIssue(issue);
+  const targetId = validateCommentId(to);
+  validateRole(role);
+  if (typeof fetchImpl !== 'function') {
+    throw new CanalError('fetch implementation is not available.');
+  }
+
+  const url = `${apiBase.replace(/\/+$/, '')}/repos/${owner}/${name}/issues/comments/${targetId}`;
+  let res;
+  try {
+    res = await fetchImpl(url, {
+      method: 'GET',
+      headers: buildHeaders(token)
+    });
+  } catch (err) {
+    throw new CanalError(
+      `Network error fetching comment ${targetId}: ${sanitizeSecrets(err?.message || err, token)}`
+    );
+  }
+
+  if (res.status === 404) {
+    throw new CanalError(`Comment ${targetId} not found in ${normalizedRepo}`);
+  }
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = await res.text();
+    } catch {
+      detail = '';
+    }
+    const cleanDetail = sanitizeSecrets(detail.slice(0, 300), token);
+    throw new CanalError(
+      `GitHub API error (${res.status}) while reading comment ${targetId}${cleanDetail ? `: ${cleanDetail}` : ''}`
+    );
+  }
+
+  const comment = await res.json();
+  if (comment && typeof comment.issue_url === 'string') {
+    const expectedSuffix = `/issues/${issueNum}`;
+    if (!comment.issue_url.endsWith(expectedSuffix)) {
+      throw new CanalError(
+        `Comment ${targetId} does not belong to issue #${issueNum} in ${normalizedRepo}.`
+      );
+    }
+  }
+
+  const originalRole = detectCommentRole(comment?.body);
+  if (originalRole === role) {
+    throw new CanalError(
+      `Comment ${targetId} was posted by ${role}, not the opposite role`
+    );
+  }
+  const expectedOpposite = getOppositeRole(role);
+  if (originalRole !== expectedOpposite) {
+    throw new CanalError(
+      `Comment ${targetId} was not posted by ${expectedOpposite}.`
+    );
+  }
+
+  return comment;
+}
+
+export async function replyComment({
+  repo,
+  issue,
+  role,
+  to,
+  body,
+  stateFile = DEFAULT_STATE_FILE,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const { repo: normalizedRepo } = validateRepo(repo);
+  const issueNum = validateIssue(issue);
+  validateRole(role);
+  const targetId = validateCommentId(to);
+  const token = getToken(env);
+  const cleanBody = stripRolePrefixForReply(body, role);
+
+  await resolveTargetComment({
+    repo: normalizedRepo,
+    issue: issueNum,
+    to: targetId,
+    role,
+    token,
+    fetchImpl,
+    apiBase
+  });
+
+  const formattedBody = `[${role}] reply-to:${targetId}\n\n${cleanBody}`;
+  const idempotencyKey = `${normalizedRepo}#${issueNum}->${targetId}\n${cleanBody}`;
+
+  return postComment({
+    repo: normalizedRepo,
+    issue: issueNum,
+    role,
+    body: formattedBody,
+    stateFile,
+    stateSection: 'repliesTo',
+    idempotencyKey,
+    extraState: { to: targetId },
+    advanceCursorTo: targetId,
+    fetchImpl,
+    env,
+    apiBase
+  });
+}
+
+export async function ackComment({
+  repo,
+  issue,
+  role,
+  to,
+  note,
+  stateFile = DEFAULT_STATE_FILE,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const { repo: normalizedRepo } = validateRepo(repo);
+  const issueNum = validateIssue(issue);
+  validateRole(role);
+  const targetId = validateCommentId(to);
+  const token = getToken(env);
+
+  const trimmedNote = note !== undefined && note !== null ? String(note).trim() : '';
+  const ackBody = trimmedNote ? `ack: ${trimmedNote}` : 'ack';
+
+  await resolveTargetComment({
+    repo: normalizedRepo,
+    issue: issueNum,
+    to: targetId,
+    role,
+    token,
+    fetchImpl,
+    apiBase
+  });
+
+  const formattedBody = `[${role}] reply-to:${targetId}\n\n${ackBody}`;
+  const idempotencyKey = `${normalizedRepo}#${issueNum}->${targetId}\n${ackBody}`;
+
+  return postComment({
+    repo: normalizedRepo,
+    issue: issueNum,
+    role,
+    body: formattedBody,
+    stateFile,
+    stateSection: 'acks',
+    idempotencyKey,
+    extraState: { to: targetId, note: trimmedNote || null },
+    fetchImpl,
+    env,
+    apiBase
+  });
+}
+
+export async function statusIssue({
+  repo,
+  issue,
+  role,
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+  apiBase = DEFAULT_API_BASE
+}) {
+  const { repo: normalizedRepo } = validateRepo(repo);
+  const issueNum = validateIssue(issue);
+  if (role !== undefined && role !== null && String(role).trim() !== '') {
+    validateRole(role);
+  } else {
+    role = undefined;
+  }
+  const token = getToken(env);
+
+  const rawComments = await fetchAllComments({
+    repo: normalizedRepo,
+    issue: issueNum,
+    token,
+    fetchImpl,
+    apiBase
+  });
+
+  const sorted = [...rawComments].sort((a, b) => {
+    const timeDiff = Date.parse(a.created_at) - Date.parse(b.created_at);
+    if (!Number.isNaN(timeDiff) && timeDiff !== 0) return timeDiff;
+    return Number(a.id) - Number(b.id);
+  });
+
+  const annotated = sorted.map((c) => ({
+    comment: c,
+    meta: parseCommentMeta(c?.body)
+  }));
+
+  const byRole = { AGENTE: 0, EJECUTOR: 0, sin_prefijo: 0 };
+  const lastByRole = { AGENTE: null, EJECUTOR: null };
+
+  for (const { comment, meta } of annotated) {
+    if (meta.role === 'AGENTE' || meta.role === 'EJECUTOR') {
+      byRole[meta.role] += 1;
+      lastByRole[meta.role] = {
+        id: comment.id,
+        created_at: comment.created_at,
+        body: String(comment.body ?? '').slice(0, 120)
+      };
+    } else {
+      byRole.sin_prefijo += 1;
+    }
+  }
+
+  function hasReplyAfter(idx, targetId, responderRole) {
+    for (let j = idx + 1; j < annotated.length; j += 1) {
+      const candidate = annotated[j];
+      if (candidate.meta.role === responderRole && candidate.meta.replyTo === targetId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function computeUnansweredFor(responderRole) {
+    const senderRole = getOppositeRole(responderRole);
+    const ids = [];
+    for (let i = 0; i < annotated.length; i += 1) {
+      const { comment, meta } = annotated[i];
+      if (meta.role !== senderRole) continue;
+      if (!hasReplyAfter(i, Number(comment.id), responderRole)) {
+        ids.push(comment.id);
+      }
+    }
+    return ids;
+  }
+
+  function computePendingEchoFor(authorRole) {
+    const responderRole = getOppositeRole(authorRole);
+    const ids = [];
+    for (let i = 0; i < annotated.length; i += 1) {
+      const { comment, meta } = annotated[i];
+      if (meta.role !== authorRole || meta.isAck) continue;
+      if (!hasReplyAfter(i, Number(comment.id), responderRole)) {
+        ids.push(comment.id);
+      }
+    }
+    return ids;
+  }
+
+  return {
+    repo: normalizedRepo,
+    issue: issueNum,
+    ...(role ? { role } : {}),
+    comments_total: annotated.length,
+    by_role: byRole,
+    last_by_role: lastByRole,
+    unanswered: role
+      ? computeUnansweredFor(role)
+      : {
+          AGENTE: computeUnansweredFor('AGENTE'),
+          EJECUTOR: computeUnansweredFor('EJECUTOR')
+        },
+    pending_echo: role
+      ? computePendingEchoFor(role)
+      : {
+          AGENTE: computePendingEchoFor('AGENTE'),
+          EJECUTOR: computePendingEchoFor('EJECUTOR')
+        }
   };
 }
 

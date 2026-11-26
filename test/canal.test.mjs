@@ -6,11 +6,15 @@ import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import {
+  ackComment,
   CanalError,
   ensureRolePrefix,
+  loadState,
   postComment,
   readComments,
+  replyComment,
   sanitizeSecrets,
+  statusIssue,
   watchComments
 } from '../src/canal.mjs';
 import { runCli } from '../src/cli.mjs';
@@ -481,6 +485,370 @@ test('CLI --help exits 0 without stack traces and --body-file works', async () =
     const parsed = JSON.parse(out);
     assert.equal(parsed.body, '[EJECUTOR] primera línea\nsegunda línea');
   });
+});
+
+test('replyComment composes exact header, updates cursor, and avoids collision with plain post', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const postedBodies = [];
+    let nextId = 800;
+
+    const fetchImpl = async (url, opts) => {
+      if (opts.method === 'GET' && url.endsWith('/issues/comments/123')) {
+        return makeResponse(
+          {
+            id: 123,
+            issue_url: 'https://api.github.com/repos/o/r/issues/1',
+            body: '[AGENTE] orden original'
+          },
+          { status: 200 }
+        );
+      }
+      if (opts.method === 'GET' && url.endsWith('/issues/1')) {
+        return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+      }
+      assert.equal(opts.method, 'POST');
+      const payload = JSON.parse(opts.body);
+      postedBodies.push(payload.body);
+      nextId += 1;
+      return makeResponse(
+        { id: nextId, created_at: '2026-11-26T05:00:00Z', body: payload.body },
+        { status: 201 }
+      );
+    };
+
+    const res = await replyComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 123,
+      body: 'cuerpo exacto\nsegunda línea',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+
+    assert.equal(res.skipped, false);
+    assert.equal(
+      postedBodies[0],
+      '[EJECUTOR] reply-to:123\n\ncuerpo exacto\nsegunda línea'
+    );
+
+    const stateAfterReply = await loadState(stateFile);
+    assert.equal(stateAfterReply.cursors['o/r#1:EJECUTOR'], 123);
+
+    // Plain post with the exact same text must NOT be treated as duplicate of a reply
+    const plainPost = await postComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      body: 'cuerpo exacto\nsegunda línea',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(plainPost.skipped, false);
+    assert.equal(postedBodies.length, 2);
+  });
+});
+
+test('replyComment fails without POST when target comment does not exist or belongs to own role', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    let postCalls = 0;
+
+    const fetchImpl = async (url, opts) => {
+      if (opts.method === 'POST') {
+        postCalls += 1;
+        return makeResponse({ id: 999 }, { status: 201 });
+      }
+      if (url.endsWith('/issues/comments/404')) {
+        return makeResponse({ message: 'Not Found' }, { status: 404 });
+      }
+      if (url.endsWith('/issues/comments/555')) {
+        return makeResponse(
+          {
+            id: 555,
+            issue_url: 'https://api.github.com/repos/o/r/issues/1',
+            body: '[EJECUTOR] mensaje propio'
+          },
+          { status: 200 }
+        );
+      }
+      return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+    };
+
+    await assert.rejects(
+      () =>
+        replyComment({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          to: 404,
+          body: 'no debe salir',
+          stateFile,
+          fetchImpl,
+          env: { GH_TOKEN: 'dummy-token' }
+        }),
+      /Comment 404 not found in o\/r/
+    );
+
+    await assert.rejects(
+      () =>
+        replyComment({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          to: 555,
+          body: 'autorespuesta prohibida',
+          stateFile,
+          fetchImpl,
+          env: { GH_TOKEN: 'dummy-token' }
+        }),
+      /Comment 555 was posted by EJECUTOR, not the opposite role/
+    );
+
+    assert.equal(postCalls, 0);
+  });
+});
+
+test('replyComment deduplicates same to+body, allows same body to different to, and handles role prefixes', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const postedBodies = [];
+
+    const fetchImpl = async (url, opts) => {
+      if (opts.method === 'GET' && /\/issues\/comments\/(10|20)$/.test(url)) {
+        const id = Number(url.split('/').pop());
+        return makeResponse(
+          {
+            id,
+            issue_url: 'https://api.github.com/repos/o/r/issues/1',
+            body: '[AGENTE] orden'
+          },
+          { status: 200 }
+        );
+      }
+      if (opts.method === 'GET' && url.endsWith('/issues/1')) {
+        return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+      }
+      const payload = JSON.parse(opts.body);
+      postedBodies.push(payload.body);
+      return makeResponse(
+        { id: 700 + postedBodies.length, created_at: '2026-11-26T05:01:00Z', body: payload.body },
+        { status: 201 }
+      );
+    };
+
+    // Strip own prefix [EJECUTOR] without duplicating
+    const r1 = await replyComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 10,
+      body: '[EJECUTOR] hecho',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(r1.skipped, false);
+    assert.equal(postedBodies[0], '[EJECUTOR] reply-to:10\n\nhecho');
+
+    // Same to + same body (without prefix) -> duplicate, skipped
+    const r1Dup = await replyComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 10,
+      body: 'hecho',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(r1Dup.skipped, true);
+    assert.equal(postedBodies.length, 1);
+
+    // Different to + same body -> NOT duplicate, posted
+    const r2 = await replyComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 20,
+      body: 'hecho',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(r2.skipped, false);
+    assert.equal(postedBodies[1], '[EJECUTOR] reply-to:20\n\nhecho');
+    assert.equal(postedBodies.length, 2);
+
+    // Body with opposite role prefix fails
+    await assert.rejects(
+      () =>
+        replyComment({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          to: 10,
+          body: '[AGENTE] suplantacion',
+          stateFile,
+          fetchImpl,
+          env: { GH_TOKEN: 'dummy-token' }
+        }),
+      /does not match --role EJECUTOR/
+    );
+    assert.equal(postedBodies.length, 2);
+  });
+});
+
+test('ackComment posts once per to+note, allows different note, and does not advance read cursor', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const postedBodies = [];
+
+    const fetchImpl = async (url, opts) => {
+      if (opts.method === 'GET' && url.endsWith('/issues/comments/321')) {
+        return makeResponse(
+          {
+            id: 321,
+            issue_url: 'https://api.github.com/repos/o/r/issues/1',
+            body: '[AGENTE] revisa esto'
+          },
+          { status: 200 }
+        );
+      }
+      if (opts.method === 'GET' && url.endsWith('/issues/1')) {
+        return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+      }
+      const payload = JSON.parse(opts.body);
+      postedBodies.push(payload.body);
+      return makeResponse(
+        { id: 900 + postedBodies.length, created_at: '2026-11-26T05:02:00Z', body: payload.body },
+        { status: 201 }
+      );
+    };
+
+    const a1 = await ackComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 321,
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(a1.skipped, false);
+    assert.equal(postedBodies[0], '[EJECUTOR] reply-to:321\n\nack');
+
+    // Duplicate ack without note -> skipped
+    const a1Dup = await ackComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 321,
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(a1Dup.skipped, true);
+    assert.equal(postedBodies.length, 1);
+
+    // Ack with distinct note -> posted
+    const a2 = await ackComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 321,
+      note: 'en progreso',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(a2.skipped, false);
+    assert.equal(postedBodies[1], '[EJECUTOR] reply-to:321\n\nack: en progreso');
+
+    // Same note again -> skipped
+    const a2Dup = await ackComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 321,
+      note: 'en progreso',
+      stateFile,
+      fetchImpl,
+      env: { GH_TOKEN: 'dummy-token' }
+    });
+    assert.equal(a2Dup.skipped, true);
+    assert.equal(postedBodies.length, 2);
+
+    // Read cursor must NOT have advanced
+    const state = await loadState(stateFile);
+    assert.equal(state.cursors['o/r#1:EJECUTOR'], undefined);
+  });
+});
+
+test('statusIssue counts roles including unprefixed, finds unanswered/pending_echo, and makes 0 POST calls', async () => {
+  let postCalls = 0;
+  const comments = [
+    {
+      id: 1,
+      created_at: '2026-11-26T04:00:00Z',
+      body: '[AGENTE] primera orden'
+    },
+    {
+      id: 2,
+      created_at: '2026-11-26T04:01:00Z',
+      body: '[EJECUTOR] reply-to:1\n\nprimera orden hecha'
+    },
+    {
+      id: 3,
+      created_at: '2026-11-26T04:02:00Z',
+      body: 'comentario humano sin prefijo'
+    },
+    {
+      id: 4,
+      created_at: '2026-11-26T04:03:00Z',
+      body: `[AGENTE] segunda orden ${'x'.repeat(150)}`
+    },
+    {
+      id: 5,
+      created_at: '2026-11-26T04:04:00Z',
+      body: '[EJECUTOR] mensaje propio esperando eco'
+    }
+  ];
+
+  const fetchImpl = async (_url, opts) => {
+    if (opts?.method && opts.method !== 'GET') {
+      postCalls += 1;
+    }
+    return makeResponse(comments, { status: 200 });
+  };
+
+  let out = '';
+  let err = '';
+  const code = await runCli(
+    ['status', '--repo', 'o/r', '--issue', '1', '--role', 'EJECUTOR'],
+    {
+      env: { GH_TOKEN: 'read-only-token' },
+      fetchImpl,
+      stdout: { write: (s) => (out += s) },
+      stderr: { write: (s) => (err += s) }
+    }
+  );
+
+  assert.equal(code, 0);
+  assert.equal(err, '');
+  assert.equal(postCalls, 0);
+
+  const summary = JSON.parse(out);
+  assert.equal(summary.comments_total, 5);
+  assert.deepEqual(summary.by_role, { AGENTE: 2, EJECUTOR: 2, sin_prefijo: 1 });
+  assert.equal(summary.last_by_role.AGENTE.id, 4);
+  assert.equal(summary.last_by_role.AGENTE.body.length, 120);
+  assert.equal(summary.last_by_role.EJECUTOR.id, 5);
+  assert.deepEqual(summary.unanswered, [4]);
+  assert.deepEqual(summary.pending_echo, [2, 5]);
 });
 
 test(
