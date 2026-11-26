@@ -956,12 +956,16 @@ async function analyzeThread({ repo, issue, role, fetchImpl, env, apiBase }) {
     return false;
   }
 
-  function computeUnansweredFor(responderRole) {
+  function computeUnansweredFor(responderRole, messagesOnly = false) {
     const senderRole = getOppositeRole(responderRole);
     const ids = [];
     for (let i = 0; i < annotated.length; i += 1) {
       const { comment, meta } = annotated[i];
       if (meta.role !== senderRole) continue;
+      // Las cabeceras de tarea ("task:T-001 claim") son marcadores de la
+      // maquina, no mensajes: no se "responden" y no deben ensuciar la
+      // cuenta de pendientes.
+      if (messagesOnly && meta.task) continue;
       if (!hasReplyAfter(i, Number(comment.id), responderRole)) {
         ids.push(comment.id);
       }
@@ -969,12 +973,14 @@ async function analyzeThread({ repo, issue, role, fetchImpl, env, apiBase }) {
     return ids;
   }
 
-  function computePendingEchoFor(authorRole) {
+  function computePendingEchoFor(authorRole, messagesOnly = false) {
     const responderRole = getOppositeRole(authorRole);
     const ids = [];
     for (let i = 0; i < annotated.length; i += 1) {
       const { comment, meta } = annotated[i];
       if (meta.role !== authorRole || meta.isAck) continue;
+      // Igual que arriba: las cabeceras de tarea no son mensajes.
+      if (messagesOnly && meta.task) continue;
       if (!hasReplyAfter(i, Number(comment.id), responderRole)) {
         ids.push(comment.id);
       }
@@ -998,6 +1004,25 @@ async function analyzeThread({ repo, issue, role, fetchImpl, env, apiBase }) {
         EJECUTOR: computePendingEchoFor('EJECUTOR')
       };
 
+  // Las mismas listas, pero solo con los comentarios que son mensajes de
+  // verdad (sin las cabeceras de tarea). Sin esto, "sin_responder" y
+  // "esperando_a_mi" contaban tambien cada "task:T-001 claim", y la
+  // reentrada decia "responder 17 comentarios" cuando solo habia 8
+  // mensajes de verdad.
+  const unansweredMessages = role
+    ? computeUnansweredFor(role, true)
+    : {
+        AGENTE: computeUnansweredFor('AGENTE', true),
+        EJECUTOR: computeUnansweredFor('EJECUTOR', true)
+      };
+
+  const pendingEchoMessages = role
+    ? computePendingEchoFor(role, true)
+    : {
+        AGENTE: computePendingEchoFor('AGENTE', true),
+        EJECUTOR: computePendingEchoFor('EJECUTOR', true)
+      };
+
   return {
     normalizedRepo,
     issueNum,
@@ -1008,6 +1033,8 @@ async function analyzeThread({ repo, issue, role, fetchImpl, env, apiBase }) {
     ultimoPorRol,
     unanswered,
     pendingEcho,
+    unansweredMessages,
+    pendingEchoMessages,
     tasksMap
   };
 }
@@ -1042,7 +1069,14 @@ export async function statusIssue({
   };
 }
 
-function buildSiguientePaso({ tasksMap, role, sinResponder, esperandoAMi }) {
+function buildSiguientePaso({
+  tasksMap,
+  role,
+  sinResponder,
+  esperandoAMi,
+  sinResponderMensajes,
+  esperandoAMiMensajes
+}) {
   const all = [...tasksMap.values()].sort((a, b) => a.id.localeCompare(b.id));
   const blocked = all.filter((t) => t.estado === 'blocked');
   const open = all.filter((t) => t.estado === 'open');
@@ -1086,17 +1120,28 @@ function buildSiguientePaso({ tasksMap, role, sinResponder, esperandoAMi }) {
   }
 
   if (parts.length === 0) {
-    const sinResponderCount = Array.isArray(sinResponder)
+    // Se cuentan los MENSAJES, no las cabeceras de tarea: una cabecera no se
+    // responde, es un marcador de la maquina.
+    const mensajes = sinResponderMensajes ?? sinResponder;
+    const esperandoMensajes = esperandoAMiMensajes ?? esperandoAMi;
+    const sinResponderCount = Array.isArray(mensajes)
+      ? mensajes.length
+      : (mensajes.AGENTE?.length || 0) + (mensajes.EJECUTOR?.length || 0);
+    const esperandoCount = Array.isArray(esperandoMensajes)
+      ? esperandoMensajes.length
+      : (esperandoMensajes.AGENTE?.length || 0) + (esperandoMensajes.EJECUTOR?.length || 0);
+    const totalSinResponder = Array.isArray(sinResponder)
       ? sinResponder.length
       : (sinResponder.AGENTE?.length || 0) + (sinResponder.EJECUTOR?.length || 0);
-    const esperandoCount = Array.isArray(esperandoAMi)
-      ? esperandoAMi.length
-      : (esperandoAMi.AGENTE?.length || 0) + (esperandoAMi.EJECUTOR?.length || 0);
+    const cabeceras = Math.max(0, totalSinResponder - sinResponderCount);
 
     if (sinResponderCount > 0) {
-      parts.push(`Responder ${sinResponderCount} comentario(s) pendiente(s) del otro rol.`);
+      parts.push(`Responder ${sinResponderCount} mensaje(s) pendiente(s) del otro rol.`);
+      if (cabeceras > 0) {
+        parts.push(`(mas ${cabeceras} cabecera(s) de tarea sin responder, que no son mensajes)`);
+      }
     } else if (esperandoCount > 0) {
-      parts.push(`Esperando respuesta del otro rol a ${esperandoCount} comentario(s).`);
+      parts.push(`Esperando respuesta del otro rol a ${esperandoCount} mensaje(s).`);
     } else if (all.length === 0) {
       parts.push('Hilo sin tareas ni mensajes pendientes.');
     } else {
@@ -1138,7 +1183,9 @@ export async function briefIssue({
     tasksMap: analysis.tasksMap,
     role: analysis.role,
     sinResponder: analysis.unanswered,
-    esperandoAMi: analysis.pendingEcho
+    esperandoAMi: analysis.pendingEcho,
+    sinResponderMensajes: analysis.unansweredMessages,
+    esperandoAMiMensajes: analysis.pendingEchoMessages
   });
 
   return {
@@ -1148,6 +1195,8 @@ export async function briefIssue({
     ultimo_por_rol: analysis.ultimoPorRol,
     sin_responder: analysis.unanswered,
     esperando_a_mi: analysis.pendingEcho,
+    sin_responder_mensajes: analysis.unansweredMessages,
+    esperando_a_mi_mensajes: analysis.pendingEchoMessages,
     tasks,
     en_curso: enCurso,
     siguiente_paso: siguientePaso,

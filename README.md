@@ -94,15 +94,20 @@ canal brief --repo gm0230199-design/canal --issue 1 --role EJECUTOR
 - `ultimo_por_rol`: latest comment `{ id, created_at, primera_linea }` for `AGENTE` and `EJECUTOR` (first line only).
 - `sin_responder`: comment IDs from the opposite role without a subsequent `reply-to:<id>` from your role.
 - `esperando_a_mi`: your own non-ack comment IDs that the opposite role has not replied to yet.
+- `sin_responder_mensajes`: same as `sin_responder` but **only real messages**: the task headers (`task:T-001 claim`) are machine markers, not something to answer, and counting them made re-entry say "respond to 17 comments" when there were 8 messages.
+- `esperando_a_mi_mensajes`: same as `esperando_a_mi`, without the task headers.
 - `tasks`: task board array (identical to `canal task list` and `canal status`, filtered by `asignado_a === role` when `--role` is given).
 - `en_curso`: all non-`done` tasks (`open`, `claimed`, `in_progress`, `blocked`) with `{ id, estado, asignado_a }`.
-- `siguiente_paso`: single derived action sentence summarizing blocked tasks (most recent first with reason), in-progress/claimed tasks for your role, open unclaimed tasks, or pending replies.
+- `siguiente_paso`: single derived action sentence summarizing blocked tasks (most recent first with reason), in-progress/claimed tasks for your role, open unclaimed tasks, or pending **messages** (headers are reported apart, not counted as messages).
 - `generado_en`: ISO-8601 UTC generation timestamp.
 
 **Example output** — this is the **real output** of the command over the fixed fixture
 `test/fixtures/thread-brief.json` (a synthetic thread, so it does not change under our feet).
 The test `test/readme-example.test.mjs` compares this block with what `briefIssue()` actually
 returns, so the documentation cannot drift away from the code again.
+<!-- canal-brief-example:start -->
+<!-- canal-brief-example:start -->
+<!-- canal-brief-example:start -->
 <!-- canal-brief-example:start -->
 ```json
 {
@@ -131,6 +136,13 @@ returns, so the documentation cannot drift away from the code again.
     107,
     108,
     109,
+    111
+  ],
+  "sin_responder_mensajes": [
+    106
+  ],
+  "esperando_a_mi_mensajes": [
+    102,
     111
   ],
   "tasks": [
@@ -178,6 +190,9 @@ returns, so the documentation cannot drift away from the code again.
   "generado_en": "2026-11-26T06:06:00.000Z"
 }
 ```
+<!-- canal-brief-example:end -->
+<!-- canal-brief-example:end -->
+<!-- canal-brief-example:end -->
 <!-- canal-brief-example:end -->
 
 ### Task board (`task`)

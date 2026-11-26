@@ -1583,6 +1583,8 @@ test('briefIssue makes 0 POST calls, handles empty thread, and matches key order
     'ultimo_por_rol',
     'sin_responder',
     'esperando_a_mi',
+    'sin_responder_mensajes',
+    'esperando_a_mi_mensajes',
     'tasks',
     'en_curso',
     'siguiente_paso',
