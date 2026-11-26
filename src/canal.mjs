@@ -207,7 +207,8 @@ function emptyState() {
     repliesTo: {},
     acks: {},
     answered: {},
-    taskEvents: {}
+    taskEvents: {},
+    taskReservations: {}
   };
 }
 
@@ -779,7 +780,7 @@ export function deriveTasksFromComments(sortedComments) {
     const note = getBodyAfterHeader(comment.body) || null;
 
     if (event === 'claim') {
-      if (task.estado === 'open') {
+      if (task.estado === 'open' || (task.estado === 'blocked' && task.asignado_a === null)) {
         task.estado = 'claimed';
         task.asignado_a = role;
         task.bloqueado_en = null;
@@ -868,10 +869,12 @@ export function formatTaskSummary(task) {
   };
 }
 
-export function formatTaskBoard(tasksMap) {
-  return [...tasksMap.values()]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map(formatTaskSummary);
+export function formatTaskBoard(tasksMap, role) {
+  let list = [...tasksMap.values()].sort((a, b) => a.id.localeCompare(b.id));
+  if (role) {
+    list = list.filter((t) => t.asignado_a === role);
+  }
+  return list.map(formatTaskSummary);
 }
 
 async function fetchSortedComments({ repo, issue, token, fetchImpl, apiBase }) {
@@ -993,7 +996,7 @@ export async function statusIssue({
           AGENTE: computePendingEchoFor('AGENTE'),
           EJECUTOR: computePendingEchoFor('EJECUTOR')
         },
-    tasks: formatTaskBoard(tasksMap)
+    tasks: formatTaskBoard(tasksMap, role)
   };
 }
 
@@ -1009,6 +1012,8 @@ export async function taskList({
   const issueNum = validateIssue(issue);
   if (role !== undefined && role !== null && String(role).trim() !== '') {
     validateRole(role);
+  } else {
+    role = undefined;
   }
   const token = getToken(env);
   const sorted = await fetchSortedComments({
@@ -1018,7 +1023,7 @@ export async function taskList({
     fetchImpl,
     apiBase
   });
-  return formatTaskBoard(deriveTasksFromComments(sorted));
+  return formatTaskBoard(deriveTasksFromComments(sorted), role);
 }
 
 export async function taskShow({
@@ -1053,12 +1058,28 @@ export async function taskShow({
   };
 }
 
-function nextTaskId(tasksMap) {
+function nextTaskId(tasksMap, reservations = {}, repo, issue) {
   let maxNum = 0;
   for (const key of tasksMap.keys()) {
     const n = Number(key.slice(2));
     if (Number.isInteger(n) && n > maxNum) {
       maxNum = n;
+    }
+  }
+  if (reservations && typeof reservations === 'object') {
+    for (const entry of Object.values(reservations)) {
+      if (
+        entry &&
+        entry.repo === repo &&
+        entry.issue === issue &&
+        typeof entry.taskId === 'string' &&
+        /^T-\d{3}$/.test(entry.taskId)
+      ) {
+        const n = Number(entry.taskId.slice(2));
+        if (Number.isInteger(n) && n > maxNum) {
+          maxNum = n;
+        }
+      }
     }
   }
   const next = maxNum + 1;
@@ -1097,17 +1118,58 @@ export async function taskAdd({
   });
   const tasksMap = deriveTasksFromComments(sorted);
 
+  const trimmedBody = String(body ?? '').replace(/\r\n/g, '\n').trim();
   let taskId;
+
   if (id !== undefined && id !== null && String(id).trim() !== '') {
+    // Explicit --id overrides any pending reservation.
     taskId = validateTaskId(id);
     if (tasksMap.has(taskId)) {
       throw new CanalError(`Task ${taskId} already exists`);
     }
   } else {
-    taskId = nextTaskId(tasksMap);
+    const addFingerprint = createHash('sha256')
+      .update(
+        `${normalizedRepo}#${issueNum}:task-add:${role}\n${trimmedTitle}\n${trimmedBody}`,
+        'utf8'
+      )
+      .digest('hex');
+
+    const state = stateFile ? await loadState(stateFile) : emptyState();
+    const reservation = state.taskReservations?.[addFingerprint];
+
+    if (reservation && typeof reservation.taskId === 'string') {
+      taskId = reservation.taskId;
+      const existingTask = tasksMap.get(taskId);
+      if (existingTask) {
+        const formattedBody = trimmedBody
+          ? `[${role}] task:${taskId}\n\nTitle: ${trimmedTitle}\n\n${trimmedBody}`
+          : `[${role}] task:${taskId}\n\nTitle: ${trimmedTitle}`;
+        const addEv = existingTask.events.find((e) => e.type === 'add');
+        return {
+          id: addEv?.id ?? null,
+          created_at: existingTask.creado_en ?? null,
+          body: formattedBody,
+          skipped: true,
+          duplicate: true,
+          taskId
+        };
+      }
+    } else {
+      taskId = nextTaskId(tasksMap, state.taskReservations, normalizedRepo, issueNum);
+      if (stateFile) {
+        state.taskReservations[addFingerprint] = {
+          repo: normalizedRepo,
+          issue: issueNum,
+          taskId,
+          role,
+          title: trimmedTitle
+        };
+        await saveState(stateFile, state);
+      }
+    }
   }
 
-  const trimmedBody = String(body ?? '').replace(/\r\n/g, '\n').trim();
   const formattedBody = trimmedBody
     ? `[${role}] task:${taskId}\n\nTitle: ${trimmedTitle}\n\n${trimmedBody}`
     : `[${role}] task:${taskId}\n\nTitle: ${trimmedTitle}`;
@@ -1170,13 +1232,17 @@ export async function taskClaim({
     };
   }
 
-  if (task.estado !== 'open') {
-    if (task.asignado_a && (task.estado === 'claimed' || task.estado === 'in_progress')) {
+  const isClaimable =
+    task.estado === 'open' || (task.estado === 'blocked' && task.asignado_a === null);
+
+  if (!isClaimable) {
+    if (task.asignado_a) {
       throw new CanalError(`Task ${taskId} is already claimed by ${task.asignado_a}`);
     }
     throw new CanalError(`Task ${taskId} is already ${task.estado}`);
   }
 
+  const lastEventId = task.events.length > 0 ? task.events[task.events.length - 1].id : 0;
   const formattedBody = `[${role}] task:${taskId} claim`;
   const result = await postComment({
     repo: normalizedRepo,
@@ -1185,7 +1251,7 @@ export async function taskClaim({
     body: formattedBody,
     stateFile,
     stateSection: 'taskEvents',
-    idempotencyKey: `${normalizedRepo}#${issueNum}:task:${taskId}:claim:${role}`,
+    idempotencyKey: `${normalizedRepo}#${issueNum}:task:${taskId}:claim:${role}:after:${lastEventId}`,
     extraState: { taskId, event: 'claim' },
     fetchImpl,
     env,
@@ -1281,6 +1347,12 @@ export async function taskDone({
   const task = tasksMap.get(taskId);
   if (!task) {
     throw new CanalError(`Task ${taskId} not found in ${normalizedRepo}#${issueNum}.`);
+  }
+
+  if (task.estado === 'blocked' && task.asignado_a === null) {
+    throw new CanalError(
+      `Task ${taskId} is blocked with no claiming role; claim it before marking done.`
+    );
   }
 
   if (task.asignado_a && task.asignado_a !== role) {

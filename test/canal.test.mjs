@@ -1247,6 +1247,311 @@ test('task blocked reopens done, done resolves blocked, empty note fails, ack do
   });
 });
 
+test('D1: unassigned blocked task recovers via open -> blocked -> claim -> progress -> done, rejects done without claim, and blocks other role claim', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const mock = makeThreadMock();
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Recuperable desde blocked',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    await taskBlocked({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'sin entorno listo aun',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    // done on blocked unassigned task fails explicitly without POST
+    const callsBeforeDoneErr = mock.getPostCalls();
+    await assert.rejects(
+      () =>
+        taskDone({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          id: 'T-001',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /no claiming role; claim it before marking done/
+    );
+    assert.equal(mock.getPostCalls(), callsBeforeDoneErr);
+
+    // claim on unassigned blocked task succeeds -> claimed
+    const claimed = await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(claimed.skipped, false);
+
+    let board = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(board[0].estado, 'claimed');
+    assert.equal(board[0].asignado_a, 'EJECUTOR');
+
+    // another role trying to claim must fail with 0 POST
+    const callsBeforeOtherClaim = mock.getPostCalls();
+    await assert.rejects(
+      () =>
+        taskClaim({
+          repo: 'o/r',
+          issue: 1,
+          role: 'AGENTE',
+          id: 'T-001',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /already claimed by EJECUTOR/
+    );
+    assert.equal(mock.getPostCalls(), callsBeforeOtherClaim);
+
+    // progress -> in_progress -> done
+    await taskProgress({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'entorno reparado',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskDone({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'completado tras desbloqueo',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    board = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(board[0].estado, 'done');
+    assert.equal(board[0].asignado_a, 'EJECUTOR');
+  });
+});
+
+test('D2: task list and status.tasks apply identical asignado_a === role filtering with --role present and absent', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const mock = makeThreadMock();
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Asignada a EJECUTOR',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Asignada a AGENTE',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      id: 'T-002',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Sin asignar',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    // Without --role: both return all 3 tasks
+    const listAll = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    const statusAll = await statusIssue({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.deepEqual(
+      listAll.map((t) => t.id),
+      ['T-001', 'T-002', 'T-003']
+    );
+    assert.deepEqual(statusAll.tasks, listAll);
+
+    // With --role EJECUTOR: both return only T-001
+    const listEjecutor = await taskList({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    const statusEjecutor = await statusIssue({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.deepEqual(
+      listEjecutor.map((t) => t.id),
+      ['T-001']
+    );
+    assert.deepEqual(statusEjecutor.tasks, listEjecutor);
+
+    // With --role AGENTE: both return only T-002
+    const listAgente = await taskList({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    const statusAgente = await statusIssue({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.deepEqual(
+      listAgente.map((t) => t.id),
+      ['T-002']
+    );
+    assert.deepEqual(statusAgente.tasks, listAgente);
+  });
+});
+
+test('D3: taskAdd write-ahead reservation prevents duplicate block on socket hang up and explicit --id overrides reservation', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const comments = [];
+    let postCalls = 0;
+    let dropFirstPostResponse = true;
+
+    const fetchImpl = async (url, opts = {}) => {
+      const method = (opts.method || 'GET').toUpperCase();
+      if (method === 'GET' && url.includes('/issues/1/comments')) {
+        return makeResponse([...comments], { status: 200 });
+      }
+      if (method === 'GET' && url.endsWith('/issues/1')) {
+        return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+      }
+      if (method === 'POST' && url.endsWith('/issues/1/comments')) {
+        postCalls += 1;
+        const payload = JSON.parse(opts.body);
+        const created = {
+          id: 2000 + postCalls,
+          created_at: '2026-11-26T05:30:00Z',
+          body: payload.body
+        };
+        // Server accepts the comment, then response is lost on first attempt
+        comments.push(created);
+        if (dropFirstPostResponse) {
+          dropFirstPostResponse = false;
+          throw new Error('socket hang up');
+        }
+        return makeResponse(created, { status: 201 });
+      }
+      throw new Error(`Unexpected fetch ${method} ${url}`);
+    };
+
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    await assert.rejects(
+      () =>
+        taskAdd({
+          repo: 'o/r',
+          issue: 1,
+          role: 'AGENTE',
+          title: 'Orden unica',
+          body: 'No duplicar en reintento',
+          stateFile,
+          fetchImpl,
+          env
+        }),
+      /socket hang up/
+    );
+    assert.equal(postCalls, 1);
+    assert.equal(comments.length, 1);
+
+    // Retry with same title/body reuses reserved T-001, skips POST, and leaves only 1 block
+    const retried = await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Orden unica',
+      body: 'No duplicar en reintento',
+      stateFile,
+      fetchImpl,
+      env
+    });
+    assert.equal(retried.skipped, true);
+    assert.equal(retried.taskId, 'T-001');
+    assert.equal(postCalls, 1);
+    assert.equal(comments.length, 1);
+
+    // Explicit --id overrides reservation and creates T-009
+    const explicit = await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Orden unica',
+      body: 'No duplicar en reintento',
+      id: 'T-009',
+      stateFile,
+      fetchImpl,
+      env
+    });
+    assert.equal(explicit.skipped, false);
+    assert.equal(explicit.taskId, 'T-009');
+    assert.equal(postCalls, 2);
+
+    const board = await taskList({ repo: 'o/r', issue: 1, fetchImpl, env });
+    assert.deepEqual(
+      board.map((t) => t.id),
+      ['T-001', 'T-009']
+    );
+  });
+});
+
 test(
   'E2E integration (CANAL_E2E=1): creates temporary issue, posts, reads back, and cleans up',
   {

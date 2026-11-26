@@ -75,6 +75,8 @@ Read-only summary (`0` writes; works with a read-only `GH_TOKEN`) returning `com
 
 > **Why `ack` does not generate `pending_echo`:** an `ack` comment is an explicit receipt confirmation rather than a new prompt or question, so `status` excludes own `ack` comments from `pending_echo` to avoid infinite acknowledgement loops, and `ack` never alters task state.
 
+> **Filtering rule for `--role`:** when `--role <AGENTE|EJECUTOR>` is passed to either `canal task list` or `canal status`, both commands filter `tasks` using the exact same assignee rule (`asignado_a === <ROLE>`). When `--role` is omitted, both return the full task board sorted by `id` ascending.
+
 ```bash
 canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
 ```
@@ -85,14 +87,16 @@ Append-only task board derived directly from issue comments (no local task datab
 
 **State machine:**
 - `open`: `task add` created the block and no role has claimed it yet.
-- `claimed`: claimed by one role (`task claim`), no subsequent `progress`/`done`/`blocked`.
+- `claimed`: claimed by one role (`task claim`), from either `open` or an unassigned `blocked` block (`blocked -> claim -> claimed`), with no subsequent `progress`/`done`/`blocked`.
 - `in_progress`: at least one `task progress` recorded after `claim`.
 - `done`: closed by the claiming role (`task done`); cannot be undone, though a later `task blocked` reopens it to `blocked`.
-- `blocked`: `task blocked` recorded (from `open`, `claimed`, `in_progress`, or `done`); a subsequent `task done` by the claiming role resolves it to `done`.
+- `blocked`: `task blocked` recorded (from `open`, `claimed`, `in_progress`, or `done`). If unassigned (`asignado_a: null`), any role can recover it via `task claim` (`blocked -> claim -> claimed`); if already assigned, only the claiming role can resolve it via `task done` (`blocked -> done`).
+
+**Role filtering (`--role`):** `canal task list --role <ROLE>` filters tasks by assignee (`asignado_a === <ROLE>`), matching `canal status --role <ROLE>`. Without `--role`, both return the full board.
 
 ```bash
 canal task add      --repo gm0230199-design/canal --issue 1 --role AGENTE   --title "Construir módulo X" --body "Especificación..."
-canal task list     --repo gm0230199-design/canal --issue 1
+canal task list     --repo gm0230199-design/canal --issue 1 --role EJECUTOR
 canal task show     --repo gm0230199-design/canal --issue 1 --id T-001
 canal task claim    --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-001
 canal task progress --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-001 --note "Avance parcial"
