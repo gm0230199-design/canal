@@ -71,10 +71,33 @@ canal ack --repo gm0230199-design/canal --issue 1 --role EJECUTOR --to 718290239
 
 ### Thread status (`status`)
 
-Read-only summary (`0` writes; works with a read-only `GH_TOKEN`) returning `comments_total`, `by_role` (`AGENTE`, `EJECUTOR`, `sin_prefijo`), `last_by_role` (first 120 chars), `unanswered`, and `pending_echo`.
+Read-only summary (`0` writes; works with a read-only `GH_TOKEN`) returning `comments_total`, `by_role` (`AGENTE`, `EJECUTOR`, `sin_prefijo`), `last_by_role` (first 120 chars), `unanswered`, `pending_echo`, and `tasks` (identical array to `canal task list`).
+
+> **Why `ack` does not generate `pending_echo`:** an `ack` comment is an explicit receipt confirmation rather than a new prompt or question, so `status` excludes own `ack` comments from `pending_echo` to avoid infinite acknowledgement loops, and `ack` never alters task state.
 
 ```bash
 canal status --repo gm0230199-design/canal --issue 1 --role EJECUTOR
+```
+
+### Task board (`task`)
+
+Append-only task board derived directly from issue comments (no local task database). Headers follow `[ROLE] task:T-XXX` (`add`) or `[ROLE] task:T-XXX <claim|progress|done|blocked>`, and cannot be combined with `reply-to:`.
+
+**State machine:**
+- `open`: `task add` created the block and no role has claimed it yet.
+- `claimed`: claimed by one role (`task claim`), no subsequent `progress`/`done`/`blocked`.
+- `in_progress`: at least one `task progress` recorded after `claim`.
+- `done`: closed by the claiming role (`task done`); cannot be undone, though a later `task blocked` reopens it to `blocked`.
+- `blocked`: `task blocked` recorded (from `open`, `claimed`, `in_progress`, or `done`); a subsequent `task done` by the claiming role resolves it to `done`.
+
+```bash
+canal task add      --repo gm0230199-design/canal --issue 1 --role AGENTE   --title "Construir módulo X" --body "Especificación..."
+canal task list     --repo gm0230199-design/canal --issue 1
+canal task show     --repo gm0230199-design/canal --issue 1 --id T-001
+canal task claim    --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-001
+canal task progress --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-001 --note "Avance parcial"
+canal task done     --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-001 --note "Pruebas en verde"
+canal task blocked  --repo gm0230199-design/canal --issue 1 --role EJECUTOR --id T-002 --note "Falta credencial"
 ```
 
 ### Help

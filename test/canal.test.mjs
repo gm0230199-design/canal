@@ -15,6 +15,13 @@ import {
   replyComment,
   sanitizeSecrets,
   statusIssue,
+  taskAdd,
+  taskBlocked,
+  taskClaim,
+  taskDone,
+  taskList,
+  taskProgress,
+  taskShow,
   watchComments
 } from '../src/canal.mjs';
 import { runCli } from '../src/cli.mjs';
@@ -849,6 +856,395 @@ test('statusIssue counts roles including unprefixed, finds unanswered/pending_ec
   assert.equal(summary.last_by_role.EJECUTOR.id, 5);
   assert.deepEqual(summary.unanswered, [4]);
   assert.deepEqual(summary.pending_echo, [2, 5]);
+});
+
+function makeThreadMock() {
+  const comments = [];
+  let nextId = 1000;
+  let postCalls = 0;
+
+  const fetchImpl = async (url, opts = {}) => {
+    const method = (opts.method || 'GET').toUpperCase();
+    if (method === 'GET' && url.includes('/issues/1/comments')) {
+      return makeResponse([...comments], { status: 200 });
+    }
+    if (method === 'GET' && url.endsWith('/issues/1')) {
+      return makeResponse({ number: 1, state: 'open' }, { status: 200 });
+    }
+    if (method === 'POST' && url.endsWith('/issues/1/comments')) {
+      postCalls += 1;
+      const payload = JSON.parse(opts.body);
+      nextId += 1;
+      const created = {
+        id: nextId,
+        created_at: new Date(Date.UTC(2026, 10, 26, 5, 0, comments.length)).toISOString(),
+        body: payload.body
+      };
+      comments.push(created);
+      return makeResponse(created, { status: 201 });
+    }
+    if (method === 'GET' && /\/issues\/comments\/\d+$/.test(url)) {
+      const id = Number(url.split('/').pop());
+      const found = comments.find((c) => c.id === id);
+      if (!found) return makeResponse({ message: 'Not Found' }, { status: 404 });
+      return makeResponse(
+        { ...found, issue_url: 'https://api.github.com/repos/o/r/issues/1' },
+        { status: 200 }
+      );
+    }
+    throw new Error(`Unexpected fetch ${method} ${url}`);
+  };
+
+  return {
+    comments,
+    fetchImpl,
+    getPostCalls: () => postCalls
+  };
+}
+
+test('task add auto-generates next free ID and rejects duplicate explicit ID without POST', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const mock = makeThreadMock();
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    const t1 = await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Primer bloque',
+      body: 'Especificación 1',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(t1.taskId, 'T-001');
+
+    const t2 = await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Segundo bloque',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(t2.taskId, 'T-002');
+    assert.equal(mock.getPostCalls(), 2);
+
+    await assert.rejects(
+      () =>
+        taskAdd({
+          repo: 'o/r',
+          issue: 1,
+          role: 'AGENTE',
+          title: 'Duplicado',
+          id: 'T-001',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /Task T-001 already exists/
+    );
+    assert.equal(mock.getPostCalls(), 2);
+  });
+});
+
+test('task state machine: open -> claimed -> in_progress -> done, plus claim/done guards and idempotency', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const mock = makeThreadMock();
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Implementar tablero',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    // progress on open fails without POST
+    const callsBeforeErr = mock.getPostCalls();
+    await assert.rejects(
+      () =>
+        taskProgress({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          id: 'T-001',
+          note: 'avance prematuro',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /open/
+    );
+    assert.equal(mock.getPostCalls(), callsBeforeErr);
+
+    let list = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(list[0].estado, 'open');
+
+    // claim
+    const c1 = await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(c1.skipped, false);
+
+    // idempotent claim by same role -> skipped, 0 POST
+    const callsAfterClaim = mock.getPostCalls();
+    const c1Dup = await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(c1Dup.skipped, true);
+    assert.equal(mock.getPostCalls(), callsAfterClaim);
+
+    // claim by another role fails, 0 POST
+    await assert.rejects(
+      () =>
+        taskClaim({
+          repo: 'o/r',
+          issue: 1,
+          role: 'AGENTE',
+          id: 'T-001',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /already claimed by EJECUTOR/
+    );
+    assert.equal(mock.getPostCalls(), callsAfterClaim);
+
+    list = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(list[0].estado, 'claimed');
+    assert.equal(list[0].asignado_a, 'EJECUTOR');
+
+    // progress -> in_progress (two distinct progress notes post; identical retry skips)
+    await taskProgress({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'avance 1',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskProgress({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'avance 2',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    list = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(list[0].estado, 'in_progress');
+    assert.equal(list[0].ultimo_avance.note, 'avance 2');
+
+    // done by wrong role fails, 0 POST
+    const callsBeforeDoneErr = mock.getPostCalls();
+    await assert.rejects(
+      () =>
+        taskDone({
+          repo: 'o/r',
+          issue: 1,
+          role: 'AGENTE',
+          id: 'T-001',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /only the claiming role can close it/
+    );
+    assert.equal(mock.getPostCalls(), callsBeforeDoneErr);
+
+    // done by claiming role -> done, second done is idempotent
+    const d1 = await taskDone({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'cerrado',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(d1.skipped, false);
+    const callsAfterDone = mock.getPostCalls();
+
+    const d1Dup = await taskDone({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(d1Dup.skipped, true);
+    assert.equal(mock.getPostCalls(), callsAfterDone);
+
+    list = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    assert.equal(list[0].estado, 'done');
+  });
+});
+
+test('task blocked reopens done, done resolves blocked, empty note fails, ack does not alter task, and status.tasks matches task list', async () => {
+  await withTempDir(async (dir) => {
+    const stateFile = path.join(dir, '.canal-state.json');
+    const mock = makeThreadMock();
+    const env = { GH_TOKEN: 'dummy-token' };
+
+    // Add normal + malformed task headers + regular AGENTE comment
+    mock.comments.push(
+      {
+        id: 10,
+        created_at: '2026-11-26T04:50:00Z',
+        body: '[AGENTE] comentario normal para ack'
+      },
+      {
+        id: 11,
+        created_at: '2026-11-26T04:50:01Z',
+        body: '[AGENTE] task:T-1 mal formado corto'
+      },
+      {
+        id: 12,
+        created_at: '2026-11-26T04:50:02Z',
+        body: '[AGENTE] task:xyz mal formado letras'
+      },
+      {
+        id: 13,
+        created_at: '2026-11-26T04:50:03Z',
+        body: '[OTRO] task:T-099 rol invalido'
+      },
+      {
+        id: 14,
+        created_at: '2026-11-26T04:50:04Z',
+        body: '[AGENTE] reply-to:10 task:T-098 mezclado invalido'
+      }
+    );
+
+    await taskAdd({
+      repo: 'o/r',
+      issue: 1,
+      role: 'AGENTE',
+      title: 'Bloque bloqueable',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskClaim({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    // Empty blocked note fails without POST
+    const callsBefore = mock.getPostCalls();
+    await assert.rejects(
+      () =>
+        taskBlocked({
+          repo: 'o/r',
+          issue: 1,
+          role: 'EJECUTOR',
+          id: 'T-001',
+          note: '   ',
+          stateFile,
+          fetchImpl: mock.fetchImpl,
+          env
+        }),
+      /non-empty --note/
+    );
+    assert.equal(mock.getPostCalls(), callsBefore);
+
+    // Done, then blocked after done -> reopens to blocked, then done after blocked -> done
+    await taskDone({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    await taskBlocked({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'fallo detectado en CI',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    let detail = await taskShow({
+      repo: 'o/r',
+      issue: 1,
+      id: 'T-001',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+    assert.equal(detail.estado, 'blocked');
+    assert.equal(detail.bloqueado_en.reason, 'fallo detectado en CI');
+
+    await taskDone({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      id: 'T-001',
+      note: 'resuelto',
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    // ack on normal comment must not affect task state
+    await ackComment({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      to: 10,
+      stateFile,
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    const list = await taskList({ repo: 'o/r', issue: 1, fetchImpl: mock.fetchImpl, env });
+    const status = await statusIssue({
+      repo: 'o/r',
+      issue: 1,
+      role: 'EJECUTOR',
+      fetchImpl: mock.fetchImpl,
+      env
+    });
+
+    assert.equal(list.length, 1);
+    assert.equal(list[0].id, 'T-001');
+    assert.equal(list[0].estado, 'done');
+    assert.deepEqual(status.tasks, list);
+  });
 });
 
 test(
