@@ -99,7 +99,11 @@ canal brief --repo gm0230199-design/canal --issue 1 --role EJECUTOR
 - `siguiente_paso`: single derived action sentence summarizing blocked tasks (most recent first with reason), in-progress/claimed tasks for your role, open unclaimed tasks, or pending replies.
 - `generado_en`: ISO-8601 UTC generation timestamp.
 
-**Example output:**
+**Example output** — this is the **real output** of the command over the fixed fixture
+`test/fixtures/thread-brief.json` (a synthetic thread, so it does not change under our feet).
+The test `test/readme-example.test.mjs` compares this block with what `briefIssue()` actually
+returns, so the documentation cannot drift away from the code again.
+<!-- canal-brief-example:start -->
 ```json
 {
   "repo": "gm0230199-design/canal",
@@ -107,24 +111,74 @@ canal brief --repo gm0230199-design/canal --issue 1 --role EJECUTOR
   "role": "EJECUTOR",
   "ultimo_por_rol": {
     "AGENTE": {
-      "id": 7183897791,
-      "created_at": "2026-11-26T05:53:27Z",
-      "primera_linea": "[AGENTE] Bloque 4 **cerrado y aprobado**. D1, D2 y D3 están **corregidos y verificados por mi cuenta**."
+      "id": 110,
+      "created_at": "2026-11-26T06:05:00Z",
+      "primera_linea": "[AGENTE] Estado del bloque 5 pendiente de revision"
     },
     "EJECUTOR": {
-      "id": 7183835464,
-      "created_at": "2026-11-26T05:49:17Z",
-      "primera_linea": "[EJECUTOR] task:T-002 done"
+      "id": 111,
+      "created_at": "2026-11-26T06:06:00Z",
+      "primera_linea": "[EJECUTOR] reply-to:110"
     }
   },
-  "sin_responder": [7182803101, 7182990807, 7183897791],
-  "esperando_a_mi": [7182861641],
-  "tasks": [],
-  "en_curso": [],
-  "siguiente_paso": "Todos los bloques (2) están en done y sin mensajes pendientes.",
-  "generado_en": "2026-11-26T05:55:00.000Z"
+  "sin_responder": [
+    106
+  ],
+  "esperando_a_mi": [
+    102,
+    103,
+    105,
+    107,
+    108,
+    109,
+    111
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Brief de reentrada solo lectura",
+      "estado": "in_progress",
+      "asignado_a": "EJECUTOR",
+      "creado_en": "2026-11-26T06:01:00Z",
+      "ultimo_avance": {
+        "id": 105,
+        "role": "EJECUTOR",
+        "created_at": "2026-11-26T06:02:00Z",
+        "note": "Ejemplos regenerados"
+      }
+    },
+    {
+      "id": "T-002",
+      "title": "buildHeaders con token vacio",
+      "estado": "blocked",
+      "asignado_a": "EJECUTOR",
+      "creado_en": "2026-11-26T06:03:00Z",
+      "ultimo_avance": null,
+      "bloqueado_en": {
+        "id": 109,
+        "role": "EJECUTOR",
+        "created_at": "2026-11-26T06:04:00Z",
+        "reason": "falta el test de la cabecera Authorization"
+      }
+    }
+  ],
+  "en_curso": [
+    {
+      "id": "T-001",
+      "estado": "in_progress",
+      "asignado_a": "EJECUTOR"
+    },
+    {
+      "id": "T-002",
+      "estado": "blocked",
+      "asignado_a": "EJECUTOR"
+    }
+  ],
+  "siguiente_paso": "Bloqueado T-002: falta el test de la cabecera Authorization. En progreso (EJECUTOR): T-001.",
+  "generado_en": "2026-11-26T06:06:00.000Z"
 }
 ```
+<!-- canal-brief-example:end -->
 
 ### Task board (`task`)
 

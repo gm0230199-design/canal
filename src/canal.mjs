@@ -242,12 +242,18 @@ export async function saveState(stateFile = DEFAULT_STATE_FILE, state) {
 }
 
 function buildHeaders(token) {
-  return {
+  const headers = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'canal-cli/0.1.0',
     'X-GitHub-Api-Version': '2022-11-28'
   };
+  // Sin token NO se manda Authorization: mandar "Bearer " vacio hace que
+  // GitHub responda 401 Bad credentials en vez de tratar la peticion como
+  // anonima, y eso rompe la lectura de repos publicos sin credenciales.
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
 }
 
 export async function fetchAllComments({
